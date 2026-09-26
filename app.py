@@ -60,8 +60,9 @@ class RandomizationStore:
                 CREATE TABLE IF NOT EXISTS strata(
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     trial_id INTEGER NOT NULL REFERENCES trials(id),
+                    revision_no INTEGER NOT NULL DEFAULT 0,
                     stratum_key TEXT NOT NULL, factors_json TEXT NOT NULL, created_at TEXT NOT NULL,
-                    UNIQUE(trial_id,stratum_key)
+                    UNIQUE(trial_id,revision_no,stratum_key)
                 );
                 CREATE TABLE IF NOT EXISTS allocations(
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -95,8 +96,55 @@ class RandomizationStore:
                     actor_id TEXT NOT NULL REFERENCES users(id), action TEXT NOT NULL,
                     detail TEXT NOT NULL, created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS protocol_amendments(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    trial_id INTEGER NOT NULL REFERENCES trials(id),
+                    revision_no INTEGER NOT NULL,
+                    protocol_version TEXT NOT NULL,
+                    arms_json TEXT NOT NULL, strata_factors_json TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending'
+                        CHECK(status IN ('pending','effective','rejected')),
+                    submitted_by TEXT NOT NULL REFERENCES users(id), submitted_at TEXT NOT NULL,
+                    first_confirmer TEXT REFERENCES users(id), first_confirmed_at TEXT,
+                    second_confirmer TEXT REFERENCES users(id), second_confirmed_at TEXT,
+                    rejected_by TEXT REFERENCES users(id), rejected_at TEXT, reject_reason TEXT,
+                    effective_at TEXT,
+                    UNIQUE(trial_id,revision_no)
+                );
                 """
             )
+            self._migrate(conn)
+
+    def _migrate(self, conn):
+        """为旧库补齐方案修订所需列与唯一约束。"""
+        conn.commit()  # executescript 已提交；确保 PRAGMA 不在事务中
+        trial_cols = {r["name"] for r in conn.execute("PRAGMA table_info(trials)")}
+        if "revision_no" not in trial_cols:
+            conn.execute("ALTER TABLE trials ADD COLUMN revision_no INTEGER NOT NULL DEFAULT 0")
+        alloc_cols = {r["name"] for r in conn.execute("PRAGMA table_info(allocations)")}
+        if "revision_no" not in alloc_cols:
+            conn.execute("ALTER TABLE allocations ADD COLUMN revision_no INTEGER NOT NULL DEFAULT 0")
+        strata_cols = {r["name"] for r in conn.execute("PRAGMA table_info(strata)")}
+        if "revision_no" not in strata_cols:
+            conn.execute("PRAGMA foreign_keys=OFF")
+            conn.execute(
+                "CREATE TABLE strata_new(id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                "trial_id INTEGER NOT NULL REFERENCES trials(id),revision_no INTEGER NOT NULL DEFAULT 0,"
+                "stratum_key TEXT NOT NULL,factors_json TEXT NOT NULL,created_at TEXT NOT NULL,"
+                "UNIQUE(trial_id,revision_no,stratum_key))"
+            )
+            conn.execute(
+                "INSERT INTO strata_new(id,trial_id,revision_no,stratum_key,factors_json,created_at)"
+                " SELECT id,trial_id,0,stratum_key,factors_json,created_at FROM strata"
+            )
+            conn.execute("DROP TABLE strata")
+            conn.execute("ALTER TABLE strata_new RENAME TO strata")
+            conn.commit()
+            conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_strata_trial_rev_key "
+            "ON strata(trial_id,revision_no,stratum_key)"
+        )
 
     def seed(self):
         self.init_schema()
@@ -208,13 +256,17 @@ class RandomizationStore:
         normalized = {k: str(factors[k]).strip() for k in sorted(expected)}
         if any(not v for v in normalized.values()):
             raise BusinessError("分层因素值不能为空", 422, "invalid_factors")
+        revision = trial["revision_no"]
         key = f"{site_id}|" + json.dumps(normalized, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-        row = conn.execute("SELECT * FROM strata WHERE trial_id=? AND stratum_key=?", (trial["id"], key)).fetchone()
+        row = conn.execute(
+            "SELECT * FROM strata WHERE trial_id=? AND revision_no=? AND stratum_key=?",
+            (trial["id"], revision, key),
+        ).fetchone()
         if row:
             return row
         cur = conn.execute(
-            "INSERT INTO strata(trial_id,stratum_key,factors_json,created_at) VALUES(?,?,?,?)",
-            (trial["id"], key, json.dumps({"site_id": site_id, **normalized}, ensure_ascii=False, sort_keys=True), now()),
+            "INSERT INTO strata(trial_id,revision_no,stratum_key,factors_json,created_at) VALUES(?,?,?,?,?)",
+            (trial["id"], revision, key, json.dumps({"site_id": site_id, **normalized}, ensure_ascii=False, sort_keys=True), now()),
         )
         return conn.execute("SELECT * FROM strata WHERE id=?", (cur.lastrowid,)).fetchone()
 
@@ -224,7 +276,11 @@ class RandomizationStore:
                 "SELECT COUNT(*) FROM allocations WHERE stratum_id=? AND block_no=?", (stratum["id"], block_no)
             ).fetchone()[0]
             if count == 0:
-                rng = random.Random(f"{trial['seed']}:{stratum['stratum_key']}:{block_no}")
+                # 修订版本号进入随机种子：新规则生成的随机序列与旧规则完全隔离，
+                # 早先为旧规则预留但未使用的随机号不会再被发给新规则下的受试者。
+                # 修订 0 沿用原始种子格式，保证修订功能上线前已生成的随机表逐位一致。
+                rev_tag = "" if trial["revision_no"] == 0 else f":r{trial['revision_no']}"
+                rng = random.Random(f"{trial['seed']}{rev_tag}:{stratum['stratum_key']}:{block_no}")
                 arms = json.loads(trial["arms_json"])
                 plan = []
                 blocks = len(arms) if trial["block_size"] > len(arms) else 1
@@ -236,8 +292,8 @@ class RandomizationStore:
                 ).fetchone()[0]
                 for offset, arm in enumerate(plan, 1):
                     conn.execute(
-                        "INSERT INTO allocations(trial_id,stratum_id,sequence,block_no,arm) VALUES(?,?,?,?,?)",
-                        (trial["id"], stratum["id"], start + offset, block_no, arm),
+                        "INSERT INTO allocations(trial_id,stratum_id,revision_no,sequence,block_no,arm) VALUES(?,?,?,?,?,?)",
+                        (trial["id"], stratum["id"], trial["revision_no"], start + offset, block_no, arm),
                     )
             free = conn.execute(
                 "SELECT * FROM allocations WHERE stratum_id=? AND used_by IS NULL ORDER BY sequence LIMIT 1", (stratum["id"],)
@@ -257,6 +313,14 @@ class RandomizationStore:
                 trial = self._trial(conn, trial_id)
                 if trial["status"] != "running":
                     raise BusinessError("试验尚未开始或已经停止", 409, "trial_not_running")
+                pending = conn.execute(
+                    "SELECT id FROM protocol_amendments WHERE trial_id=? AND status='pending'", (trial_id,)
+                ).fetchone()
+                if pending:
+                    raise BusinessError(
+                        f"方案修订(编号{pending['id']})等待双人确认，入组已暂停；生效前仍按旧规则执行",
+                        409, "enrollment_paused_amendment_pending",
+                    )
                 existing = conn.execute(
                     "SELECT * FROM participants WHERE trial_id=? AND external_id=?", (trial_id, external_id)
                 ).fetchone()
@@ -275,7 +339,7 @@ class RandomizationStore:
                 )
                 participant_id = cur.lastrowid
                 conn.execute("UPDATE allocations SET used_by=?,used_at=? WHERE id=?", (participant_id, now(), allocation["id"]))
-                self._audit(conn, trial_id, user_id, "participant.enroll", {"participant_id": participant_id, "external_id": external_id, "allocation_id": allocation["id"], "site_id": actor["site_id"]})
+                self._audit(conn, trial_id, user_id, "participant.enroll", {"participant_id": participant_id, "external_id": external_id, "allocation_id": allocation["id"], "site_id": actor["site_id"], "revision_no": trial["revision_no"]})
                 participant = conn.execute("SELECT * FROM participants WHERE id=?", (participant_id,)).fetchone()
                 return self._blinded_participant(conn, participant, actor, allow_arm=False, idempotent=False)
             except sqlite3.IntegrityError as exc:
@@ -375,6 +439,154 @@ class RandomizationStore:
                 conn.rollback()
                 raise
 
+    def submit_amendment(self, user_id, trial_id, protocol_version, arms, strata_factors):
+        protocol_version = str(protocol_version).strip()
+        if not protocol_version:
+            raise BusinessError("新方案版本号不能为空", 422, "protocol_version_required")
+        if not isinstance(arms, list) or not isinstance(strata_factors, list):
+            raise BusinessError("新分组和分层因素必须以数组提供", 422, "invalid_amendment")
+        arms = [str(a).strip() for a in arms]
+        strata_factors = [str(s).strip() for s in strata_factors]
+        with self.connect() as conn:
+            self._user(conn, user_id, {"coordinator"})
+            trial = self._trial(conn, trial_id)
+            if trial["status"] != "running":
+                raise BusinessError("只有入组中的试验可以提交方案修订", 409, "invalid_status")
+            existing = conn.execute(
+                "SELECT id,status FROM protocol_amendments WHERE trial_id=?", (trial_id,)
+            ).fetchall()
+            if any(a["status"] == "pending" for a in existing):
+                raise BusinessError("已有方案修订等待确认，不能重复提交", 409, "amendment_pending")
+            if any(a["status"] == "effective" for a in existing):
+                raise BusinessError("方案修订已经生效，不能再次修订", 409, "amendment_locked")
+            old_arms = json.loads(trial["arms_json"])
+            old_factors = json.loads(trial["strata_factors_json"])
+            # 分组与分层规则一并校验；区组长度和种子保持不变，保证随机表生成机制一致。
+            self.create_trial_validation_only(arms, strata_factors, trial["block_size"], trial["seed"])
+            if arms == old_arms and strata_factors == old_factors:
+                raise BusinessError("新分组和分层规则与现行方案一致，无需修订", 422, "amendment_no_change")
+            revision_row = conn.execute(
+                "SELECT COALESCE(MAX(revision_no),0) AS rev FROM protocol_amendments WHERE trial_id=?", (trial_id,)
+            ).fetchone()
+            revision_no = max(trial["revision_no"] or 0, revision_row["rev"]) + 1
+            cur = conn.execute(
+                """INSERT INTO protocol_amendments(trial_id,revision_no,protocol_version,arms_json,
+                       strata_factors_json,submitted_by,submitted_at)
+                   VALUES(?,?,?,?,?,?,?)""",
+                (trial_id, revision_no, protocol_version, json.dumps(arms, ensure_ascii=False),
+                 json.dumps(strata_factors, ensure_ascii=False), user_id, now()),
+            )
+            self._audit(conn, trial_id, user_id, "amendment.submit", {
+                "amendment_id": cur.lastrowid, "revision_no": revision_no,
+                "protocol_version": protocol_version,
+                "old": {"arms": old_arms, "strata_factors": old_factors},
+                "new": {"arms": arms, "strata_factors": strata_factors},
+            })
+            saved = conn.execute("SELECT * FROM protocol_amendments WHERE id=?", (cur.lastrowid,)).fetchone()
+            return self._amendment_dict(saved, include_arms=True)
+
+    def confirm_amendment(self, user_id, amendment_id):
+        with self.connect() as conn:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                self._user(conn, user_id, {"monitor"})
+                row = conn.execute("SELECT * FROM protocol_amendments WHERE id=?", (amendment_id,)).fetchone()
+                if not row:
+                    raise BusinessError("方案修订不存在", 404, "not_found")
+                trial = self._trial(conn, row["trial_id"])
+                if trial["status"] != "running":
+                    raise BusinessError("试验已停止，不能再确认修订", 409, "invalid_status")
+                if row["status"] != "pending":
+                    raise BusinessError("该修订已结束，不能重复确认", 409, "amendment_closed")
+                if row["first_confirmer"] is None:
+                    conn.execute(
+                        "UPDATE protocol_amendments SET first_confirmer=?,first_confirmed_at=? WHERE id=?",
+                        (user_id, now(), amendment_id),
+                    )
+                    self._audit(conn, row["trial_id"], user_id, "amendment.confirm.first",
+                                {"amendment_id": amendment_id, "revision_no": row["revision_no"]})
+                    conn.commit()
+                    return self._amendment_dict(
+                        conn.execute("SELECT * FROM protocol_amendments WHERE id=?", (amendment_id,)).fetchone())
+                if row["first_confirmer"] == user_id:
+                    raise BusinessError("两次确认必须由不同监查员完成", 409, "distinct_confirmer_required")
+                effective_at = now()
+                conn.execute(
+                    """UPDATE protocol_amendments SET second_confirmer=?,second_confirmed_at=?,
+                           status='effective',effective_at=? WHERE id=?""",
+                    (user_id, effective_at, effective_at, amendment_id),
+                )
+                conn.execute(
+                    """UPDATE trials SET revision_no=?,protocol_version=?,arms_json=?,strata_factors_json=? WHERE id=?""",
+                    (row["revision_no"], row["protocol_version"], row["arms_json"],
+                     row["strata_factors_json"], row["trial_id"]),
+                )
+                self._audit(conn, row["trial_id"], user_id, "amendment.confirm.second", {
+                    "amendment_id": amendment_id, "revision_no": row["revision_no"],
+                    "effective_at": effective_at,
+                })
+                self._audit(conn, row["trial_id"], user_id, "amendment.effective", {
+                    "revision_no": row["revision_no"], "protocol_version": row["protocol_version"],
+                    "arms": json.loads(row["arms_json"]),
+                    "strata_factors": json.loads(row["strata_factors_json"]),
+                })
+                conn.commit()
+                return self._amendment_dict(
+                    conn.execute("SELECT * FROM protocol_amendments WHERE id=?", (amendment_id,)).fetchone())
+            except Exception:
+                conn.rollback()
+                raise
+
+    def reject_amendment(self, user_id, amendment_id, reason):
+        reason = str(reason or "").strip()
+        with self.connect() as conn:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                self._user(conn, user_id, {"monitor"})
+                row = conn.execute("SELECT * FROM protocol_amendments WHERE id=?", (amendment_id,)).fetchone()
+                if not row:
+                    raise BusinessError("方案修订不存在", 404, "not_found")
+                if row["status"] != "pending":
+                    raise BusinessError("该修订已结束，不能驳回", 409, "amendment_closed")
+                conn.execute(
+                    "UPDATE protocol_amendments SET status='rejected',rejected_by=?,rejected_at=?,reject_reason=? WHERE id=?",
+                    (user_id, now(), reason, amendment_id),
+                )
+                self._audit(conn, row["trial_id"], user_id, "amendment.reject",
+                            {"amendment_id": amendment_id, "revision_no": row["revision_no"], "reason": reason})
+                conn.commit()
+                return self._amendment_dict(
+                    conn.execute("SELECT * FROM protocol_amendments WHERE id=?", (amendment_id,)).fetchone())
+            except Exception:
+                conn.rollback()
+                raise
+
+    def list_amendments(self, user_id, trial_id):
+        with self.connect() as conn:
+            actor = self._user(conn, user_id, {"site", "coordinator", "monitor"})
+            self._trial(conn, trial_id)
+            rows = conn.execute(
+                "SELECT * FROM protocol_amendments WHERE trial_id=? ORDER BY revision_no", (trial_id,)
+            ).fetchall()
+            # 分组（试验用药/器械臂）对中心用户保密；监查员与协调员可见完整修订内容。
+            return [self._amendment_dict(r, include_arms=actor["role"] != "site") for r in rows]
+
+    @staticmethod
+    def _amendment_dict(row, include_arms=True):
+        data = {
+            "id": row["id"], "trial_id": row["trial_id"], "revision_no": row["revision_no"],
+            "protocol_version": row["protocol_version"], "status": row["status"],
+            "submitted_by": row["submitted_by"], "submitted_at": row["submitted_at"],
+            "first_confirmer": row["first_confirmer"], "first_confirmed_at": row["first_confirmed_at"],
+            "second_confirmer": row["second_confirmer"], "second_confirmed_at": row["second_confirmed_at"],
+            "rejected_by": row["rejected_by"], "rejected_at": row["rejected_at"],
+            "reject_reason": row["reject_reason"], "effective_at": row["effective_at"],
+            "strata_factors": json.loads(row["strata_factors_json"]),
+        }
+        if include_arms:
+            data["arms"] = json.loads(row["arms_json"])
+        return data
+
     def trial_summary(self, user_id, trial_id):
         with self.connect() as conn:
             actor = self._user(conn, user_id, {"site", "coordinator", "monitor"})
@@ -387,8 +599,31 @@ class RandomizationStore:
                 f"SELECT site_id,COUNT(*) AS count FROM participants WHERE trial_id=?" + where + " GROUP BY site_id", params
             ).fetchall()
             audit = conn.execute("SELECT * FROM audit_log WHERE trial_id=? ORDER BY id", (trial_id,)).fetchall()
+            pending = conn.execute(
+                "SELECT id FROM protocol_amendments WHERE trial_id=? AND status='pending'", (trial_id,)
+            ).fetchone()
+            reserved = conn.execute(
+                """SELECT revision_no, COUNT(*) AS reserved_unused
+                   FROM allocations WHERE trial_id=? AND used_by IS NULL GROUP BY revision_no ORDER BY revision_no""",
+                (trial_id,),
+            ).fetchall()
+            amendment_rows = conn.execute(
+                "SELECT * FROM protocol_amendments WHERE trial_id=? ORDER BY revision_no", (trial_id,)
+            ).fetchall()
+            include_arms = actor["role"] != "site"
             return {
-                "trial": {"id": trial["id"], "name": trial["name"], "protocol_version": trial["protocol_version"], "status": trial["status"]},
+                "trial": {
+                    "id": trial["id"], "name": trial["name"],
+                    "protocol_version": trial["protocol_version"], "status": trial["status"],
+                    "revision_no": trial["revision_no"],
+                    "strata_factors": json.loads(trial["strata_factors_json"]),
+                    **({"arms": json.loads(trial["arms_json"])} if include_arms else {}),
+                },
+                "enrollment_paused": pending is not None and trial["status"] == "running",
+                "pending_amendment_id": pending["id"] if pending else None,
+                "amendments_locked": any(a["status"] == "effective" for a in amendment_rows),
+                "amendments": [self._amendment_dict(r, include_arms=include_arms) for r in amendment_rows],
+                "reserved_unused_by_revision": [dict(r) for r in reserved],
                 "participants_visible": total, "by_site": [dict(x) for x in by_site],
                 "audit": [dict(x) | {"detail": json.loads(x["detail"])} for x in audit],
             }
@@ -426,6 +661,13 @@ class Handler(BaseHTTPRequestHandler):
             if len(parts)==4 and parts[3]=="enroll" and method=="POST":
                 d=self._body(); return self._send(201, store.enroll(user,trial_id,d.get("external_id",""),d.get("factors",{})))
             if len(parts)==4 and parts[3]=="summary" and method=="GET": return self._send(200, store.trial_summary(user,trial_id))
+            if len(parts)==4 and parts[3]=="amendments" and method=="GET": return self._send(200, {"items": store.list_amendments(user,trial_id)})
+            if len(parts)==4 and parts[3]=="amendments" and method=="POST":
+                d=self._body(); return self._send(201, store.submit_amendment(user,trial_id,d.get("protocol_version",""),d.get("arms"),d.get("strata_factors")))
+        if len(parts)==4 and parts[:2]==["api","protocol-amendments"] and parts[3]=="confirm" and method=="POST":
+            return self._send(200, store.confirm_amendment(user,int(parts[2])))
+        if len(parts)==4 and parts[:2]==["api","protocol-amendments"] and parts[3]=="reject" and method=="POST":
+            d=self._body(); return self._send(200, store.reject_amendment(user,int(parts[2]),d.get("reason","")))
         if len(parts)==3 and parts[:2]==["api","participants"] and method=="GET": return self._send(200, store.get_participant(user,int(parts[2])))
         if len(parts)==4 and parts[:2]==["api","participants"] and parts[3]=="unblinding-requests" and method=="POST":
             d=self._body(); return self._send(201, store.request_unblinding(user,int(parts[2]),d.get("reason","")))

@@ -1,4 +1,131 @@
 <!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>临床试验随机化</title>
-<style>body{font:16px system-ui;max-width:980px;margin:32px auto;padding:0 16px}select,button{padding:8px;margin:4px}pre{background:#f4f4f4;padding:12px;white-space:pre-wrap}.panel{border:1px solid #bbb;padding:16px;border-radius:8px}</style></head>
-<body><h1>临床试验随机分配与盲法</h1><div class="panel"><select id="user"><option>site1</option><option>site2</option><option>coord</option><option>monitor1</option><option>monitor2</option></select><input id="trial" value="1"><button onclick="load()">查看试验摘要</button></div><pre id="out"></pre>
-<script>async function load(){const r=await fetch(`/api/trials/${trial.value}/summary`,{headers:{"X-User-Id":user.value}});out.textContent=JSON.stringify(await r.json(),null,2)}</script></body></html>
+<style>
+body{font:15px system-ui;max-width:1040px;margin:24px auto;padding:0 16px;color:#222}
+h1{font-size:20px} h2{font-size:16px;margin:18px 0 8px}
+.panel{border:1px solid #bbb;padding:14px;border-radius:8px;margin:10px 0}
+select,input,button,textarea{padding:7px;margin:3px;font:inherit;box-sizing:border-box}
+button{cursor:pointer;border-radius:5px;border:1px solid #888;background:#f7f7f7}
+button.primary{background:#1d5fd6;color:#fff;border-color:#1d5fd6}
+button.danger{background:#b3372f;color:#fff;border-color:#b3372f}
+table{border-collapse:collapse;width:100%;font-size:13px} th,td{border:1px solid #ccc;padding:6px;text-align:left;vertical-align:top}
+th{background:#f0f0f0} pre{background:#f4f4f4;padding:10px;white-space:pre-wrap;border-radius:6px;font-size:12px}
+.banner{padding:10px;border-radius:6px;margin:8px 0;font-weight:600}
+.banner.paused{background:#fdecea;border:1px solid #e0a39d;color:#8a1f16}
+.banner.running{background:#e9f6ec;border:1px solid #9ccfa8;color:#1e6b31}
+.banner.locked{background:#eef1f5;border:1px solid #b9c2cf;color:#3a4658}
+.muted{color:#777;font-size:12px}.hide{display:none}
+.st-pending{color:#b45309;font-weight:700}.st-effective{color:#1e6b31;font-weight:700}.st-rejected{color:#8a1f16;font-weight:700}
+</style></head>
+<body>
+<h1>临床试验随机分配与盲法 · 方案修订</h1>
+<div class="panel">
+  用户：<select id="user"><option value="site1">site1（中心一）</option><option value="site2">site2（中心二）</option>
+  <option value="coord">coord（协调员）</option><option value="monitor1">monitor1（监查员甲）</option><option value="monitor2">monitor2（监查员乙）</option></select>
+  试验ID：<input id="trial" value="1" style="width:70px">
+  <button class="primary" onclick="load()">查看试验摘要</button>
+  <span class="muted">切换用户后重新点击“查看试验摘要”</span>
+</div>
+
+<div id="state"></div>
+
+<div class="panel" id="enrollPanel" style="display:none">
+  <h2>中心入组（按当前生效规则随机）</h2>
+  外部编号：<input id="extId" placeholder="如 S001-007"><br>
+  分层因素（JSON）：<input id="factors" style="width:360px" placeholder='{"risk":"high"}'>
+  <button onclick="enroll()">入组</button>
+  <div class="muted">响应只返回分配编号，不返回分组。</div>
+</div>
+
+<div class="panel" id="amendSubmitPanel" style="display:none">
+  <h2>协调员提交方案修订（新分组 + 新分层规则）</h2>
+  新方案版本：<input id="amVersion" placeholder="如 v2.0"><br>
+  新分组（逗号分隔）：<input id="amArms" style="width:360px" placeholder="A,B"><br>
+  新分层因素（逗号分隔）：<input id="amFactors" style="width:360px" placeholder="risk,ageband">
+  <button class="primary" onclick="submitAmendment()">提交修订</button>
+  <div class="muted">提交后入组立即暂停；须两位监查员分别确认，第二人同意后下一例起按新规则随机。修订生效后不可再改。</div>
+</div>
+
+<div class="panel" id="amendReviewPanel" style="display:none">
+  <h2>监查员确认 / 驳回</h2>
+  修订ID：<input id="amId" style="width:70px">
+  <button class="primary" onclick="confirmAmendment()">确认</button>
+  <button class="danger" onclick="rejectAmendment()">驳回</button>
+  驳回理由（可空）：<input id="rejectReason" style="width:300px">
+  <div class="muted">两位监查员须分别确认，同一人不能确认两次；驳回后入组恢复，可重新提交修订。</div>
+</div>
+
+<pre id="out" style="display:none"></pre>
+
+<script>
+const $=id=>document.getElementById(id);
+function headers(){return {"X-User-Id":$("user").value,"Content-Type":"application/json"}};
+function show(el,on){$(el).style.display=on?"block":"none"}
+function esc(s){return String(s??"").replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]))}
+async function api(url,method="GET",body){
+  const opt={method,headers:headers()}; if(body)opt.body=JSON.stringify(body);
+  const r=await fetch(url,opt), data=await r.json().catch(()=>({}));
+  if(!r.ok)throw (data.error?.message||("HTTP "+r.status)); return data;
+}
+async function load(){
+  const tid=$("trial").value, role=$("user").value;
+  try{
+    const s=await api(`/api/trials/${tid}/summary`);
+    show("enrollPanel",role==="site1"||role==="site2");
+    show("amendSubmitPanel",role==="coord");
+    show("amendReviewPanel",role==="monitor1"||role==="monitor2");
+    const t=s.trial;
+    let banner;
+    if(t.status!=="running"){banner=`<div class="banner locked">试验状态：${esc(t.status)}</div>`}
+    else if(s.enrollment_paused){banner=`<div class="banner paused">⏸ 入组已暂停：方案修订 #${s.pending_amendment_id} 等待两位监查员确认。生效前入组申请一律拒绝；规则未变，早先入组者保留原分组。</div>`}
+    else if(s.amendments_locked){banner=`<div class="banner locked">🔒 方案修订已生效，后续不能再次修订；当前版本 ${esc(t.protocol_version)}（第 ${t.revision_no} 次修订）。</div>`}
+    else{banner=`<div class="banner running">▶ 入组进行中，当前版本 ${esc(t.protocol_version)}（修订序号 ${t.revision_no}）。</div>`}
+    const arms=t.arms?`分组：${t.arms.map(esc).join(" / ")}<br>`:"";
+    const rows=(s.amendments||[]).map(a=>`<tr>
+      <td>#${a.id}<br><span class="muted">序号 ${a.revision_no}</span></td>
+      <td>${esc(a.protocol_version)}</td>
+      <td class="st-${a.status}">${({pending:"待确认",effective:"已生效",rejected:"已驳回"})[a.status]}</td>
+      <td>${esc(a.submitted_by)}<br><span class="muted">${esc(a.submitted_at)}</span></td>
+      <td>${esc(a.first_confirmer||"—")}${a.first_confirmed_at?`<br><span class="muted">${esc(a.first_confirmed_at)}</span>`:""}</td>
+      <td>${esc(a.second_confirmer||"—")}${a.second_confirmed_at?`<br><span class="muted">${esc(a.second_confirmed_at)}</span>`:""}</td>
+      <td>${esc(a.effective_at||"—")}</td>
+      <td>${(a.arms?esc(a.arms.join(", ")):"<span class='muted'>(对中心隐藏)</span>")}<br><span class="muted">分层：${esc(a.strata_factors.join(", "))}</span></td>
+      <td>${a.status==="rejected"?esc(a.rejected_by)+(a.reject_reason?`<br><span class="muted">${esc(a.reject_reason)}</span>`:""):"—"}</td>
+    </tr>`).join("")||`<tr><td colspan="9" class="muted">尚无方案修订</td></tr>`;
+    const reserved=(s.reserved_unused_by_revision||[]).map(r=>`修订${r.revision_no}：${r.reserved_unused} 个`).join("；")||"无";
+    $("state").innerHTML=`${banner}
+      <div class="panel"><h2>当前方案</h2>
+        名称：${esc(t.name)} ｜ 版本：${esc(t.protocol_version)} ｜ 修订序号：${t.revision_no} ｜ 状态：${esc(t.status)}<br>
+        ${arms}分层因素：${esc(t.strata_factors.join(", "))}<br>
+        可见受试者：${s.participants_visible} ｜ 分中心：${esc(s.by_site.map(x=>x.site_id+":"+x.count).join("，"))||"—"}<br>
+        各版本预留但未使用、不会跨规则发放的随机号：${esc(reserved)}
+      </div>
+      <div class="panel"><h2>各次方案修订状态</h2>
+      <table><tr><th>修订</th><th>版本</th><th>状态</th><th>提交</th><th>第一确认人</th><th>第二确认人</th><th>生效时间</th><th>新分组/分层</th><th>驳回</th></tr>${rows}</table></div>`;
+    $("out").style.display="none";
+  }catch(e){$("state").innerHTML=`<div class="banner paused">加载失败：${esc(e.message||e)}</div>`}
+}
+async function submitAmendment(){
+  const list=v=>v.split(",").map(x=>x.trim()).filter(Boolean);
+  try{const a=await api(`/api/trials/${$("trial").value}/amendments`,"POST",
+    {protocol_version:$("amVersion").value,arms:list($("amArms").value),strata_factors:list($("amFactors").value)});
+  $("out").style.display="block";$("out").textContent="已提交：\n"+JSON.stringify(a,null,2);load()}
+  catch(e){alert(e.message||e)}
+}
+async function confirmAmendment(){
+  try{const a=await api(`/api/protocol-amendments/${$("amId").value}/confirm`,"POST",{});
+  $("out").style.display="block";$("out").textContent="确认结果：\n"+JSON.stringify(a,null,2);load()}
+  catch(e){alert(e.message||e)}
+}
+async function rejectAmendment(){
+  try{const a=await api(`/api/protocol-amendments/${$("amId").value}/reject`,"POST",{reason:$("rejectReason").value});
+  $("out").style.display="block";$("out").textContent="驳回结果：\n"+JSON.stringify(a,null,2);load()}
+  catch(e){alert(e.message||e)}
+}
+async function enroll(){
+  let factors={}; try{factors=JSON.parse($("factors").value||"{}")}catch{alert("分层因素 JSON 格式错误");return}
+  try{const p=await api(`/api/trials/${$("trial").value}/enroll`,"POST",{external_id:$("extId").value,factors});
+  $("out").style.display="block";$("out").textContent="入组响应（不含分组）：\n"+JSON.stringify(p,null,2);load()}
+  catch(e){alert(e.message||e)}
+}
+load();
+</script></body></html>
